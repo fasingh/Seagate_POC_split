@@ -95,13 +95,29 @@ def load_page_text_json(path: str) -> Tuple[str, int, Dict[int, str]]:
     return source_pdf, page_count, text_by_page
 
 
-def render_page_png_bytes(pdf_path: str, page_index_1based: int, dpi: int = 200) -> bytes:
+def render_page_png_bytes(pdf_path: str, page_index_1based: int, dpi: int = 200, include_annotations: bool = True) -> bytes:
+    """
+    Render a PDF page as PNG bytes.
+    
+    Args:
+        pdf_path: Path to PDF file
+        page_index_1based: Page number (1-based)
+        dpi: Resolution for rendering
+        include_annotations: If True, annotations (comments, highlights, etc.) will be rendered on the image.
+                            Default is True to include annotations in the rendered image.
+    
+    Returns:
+        PNG image bytes
+    """
     doc = fitz.open(pdf_path)
     try:
         page = doc.load_page(page_index_1based - 1)
         zoom = dpi / 72.0
         mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
+        # PyMuPDF get_pixmap: annots parameter controls whether annotations are included
+        # True = include annotations (highlights, comments, stamps, etc.) in the rendered image
+        # False = render only the base page content without annotations
+        pix = page.get_pixmap(matrix=mat, alpha=False, annots=include_annotations)
         return pix.tobytes("png")
     finally:
         doc.close()

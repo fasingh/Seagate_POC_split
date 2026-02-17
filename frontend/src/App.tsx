@@ -265,11 +265,22 @@ function App() {
     if (!file || !file.name.toLowerCase().endsWith('.pdf')) return
     setSelectedFileName(file.name)
     setUploading(true)
+    // Reset all state for new upload
     setOcrStatus('running')
     setOcrProgress(0)
     setOcrCurrent(0)
     setOcrTotal(0)
     setOcrError(null)
+    setSplitStatus('idle')
+    setSplitProgress(0)
+    setSplitError(null)
+    setSplitFiles([])
+    setSegments([])
+    setSegmentTitles([])
+    setSegmentFiles([])
+    setPageTextPages([])
+    setManualFilenames(new Set())
+    setManualMeta({})
     const form = new FormData()
     form.append('file', file)
     try {
@@ -281,10 +292,12 @@ function App() {
       } else {
         setOcrStatus('error')
         setOcrError(d.error ?? 'Upload failed')
+        setJobId(null) // Clear jobId on error
       }
     } catch (err) {
       setOcrStatus('error')
       setOcrError(String(err))
+      setJobId(null) // Clear jobId on error
     }
     setUploading(false)
     if (fileInputRef.current) fileInputRef.current.value = ''
@@ -313,13 +326,35 @@ function App() {
   }
 
   const loadSplits = async () => {
-    if (!jobId) return
+    if (!jobId) {
+      // Clear split state if no jobId
+      setSplitFiles([])
+      setSegments([])
+      setSegmentTitles([])
+      setSegmentFiles([])
+      setPageTextPages([])
+      setManualFilenames(new Set())
+      setManualMeta({})
+      return
+    }
     try {
       const [splitsRes, segRes, ptRes] = await Promise.all([
         fetch(`${API}/splits/${jobId}`),
         fetch(`${API}/segments/${jobId}`),
         fetch(`${API}/page-text/${jobId}`),
       ])
+      // Check if any request failed (e.g., 404)
+      if (!splitsRes.ok || !segRes.ok || !ptRes.ok) {
+        // Job might not exist or not ready yet
+        setSplitFiles([])
+        setSegments([])
+        setSegmentTitles([])
+        setSegmentFiles([])
+        setPageTextPages([])
+        setManualFilenames(new Set())
+        setManualMeta({})
+        return
+      }
       const splitsData = await splitsRes.json()
       const segData = await segRes.json()
       const ptData = await ptRes.json()
@@ -331,7 +366,16 @@ function App() {
       setSegmentFiles(segData.output_files ?? [])
       setPageTextPages(ptData.pages ?? [])
       setReconTabIndex(0)
-    } catch { setSplitFiles([]); setSegments([]); setSegmentTitles([]); setSegmentFiles([]); setPageTextPages([]); setManualFilenames(new Set()); setManualMeta({}) }
+    } catch {
+      // On error, clear split state
+      setSplitFiles([])
+      setSegments([])
+      setSegmentTitles([])
+      setSegmentFiles([])
+      setPageTextPages([])
+      setManualFilenames(new Set())
+      setManualMeta({})
+    }
   }
 
   useEffect(() => {
