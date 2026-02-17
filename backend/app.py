@@ -19,6 +19,26 @@ from flask_cors import CORS
 UPLOAD_DIR = os.path.join(ROOT, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+
+def check_gpu_available() -> bool:
+    """Check if CUDA GPU is available and can actually execute kernels."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        # Test if we can actually run CUDA operations
+        try:
+            test_tensor = torch.zeros(1).cuda()
+            _ = test_tensor + 1
+            del test_tensor
+            torch.cuda.empty_cache()
+            return True
+        except Exception:
+            # CUDA available but can't execute (e.g., unsupported compute capability)
+            return False
+    except ImportError:
+        return False
+
 # job_id -> { "ocr": { "status", "progress", "total", "current", "error" }, "split": { ... } }
 progress_store = {}
 progress_lock = threading.Lock()
@@ -42,16 +62,42 @@ def run_ocr_job(job_id: str, pdf_path: str):
                     status="running", progress=min(100, pct), total=total, current=current
                 )
 
+        use_gpu = check_gpu_available()
+        if not use_gpu:
+            raise RuntimeError("GPU is required but not available or cannot execute CUDA operations. RTX 5070 (sm_120) requires PyTorch with sm_120 support.")
         ocr_pdf(
             pdf_path=pdf_path,
             out_dir=out_dir,
             dpi=250,
             lang="en,ms",
-            gpu=False,  # EasyOCR uses CUDA (NVIDIA only); AMD Radeon needs PyTorch+ROCm
+            gpu=True,
             write_json_each_page=False,
             progress_callback=cb,
             save_content_and_annotated=False,
         )
+        # Save page_text.json and input.pdf to recents folder with original filename
+        original_filename_path = os.path.join(out_dir, "original_filename.txt")
+        if os.path.isfile(original_filename_path):
+            try:
+                with open(original_filename_path, "r", encoding="utf-8") as f:
+                    original_filename = f.read().strip()
+                if original_filename:
+                    recents_dir = os.path.join(ROOT, "recents")
+                    os.makedirs(recents_dir, exist_ok=True)
+                    # Create safe filename: OGPDFNAME_page_text.json (preserve extension and basic chars)
+                    base_name = os.path.splitext(original_filename)[0]
+                    safe_name = re.sub(r"[^\w\-\.]", "_", base_name)
+                    recent_page_text_path = os.path.join(recents_dir, f"{safe_name}_page_text.json")
+                    recent_pdf_path = os.path.join(recents_dir, f"{safe_name}_input.pdf")
+                    page_text_path = os.path.join(out_dir, "page_text.json")
+                    pdf_path = os.path.join(out_dir, "input.pdf")
+                    import shutil
+                    if os.path.isfile(page_text_path):
+                        shutil.copy2(page_text_path, recent_page_text_path)
+                    if os.path.isfile(pdf_path):
+                        shutil.copy2(pdf_path, recent_pdf_path)
+            except Exception:
+                pass
         with progress_lock:
             progress_store[job_id]["ocr"] = {"status": "done", "progress": 100, "total": 0, "current": 0}
     except Exception as e:
@@ -70,6 +116,36 @@ def run_split_job(job_id: str):
     pdf_path = os.path.join(out_dir, "input.pdf")
     page_text_path = os.path.join(out_dir, "page_text.json")
     splits_dir = os.path.join(out_dir, "splits")
+    # Verify required files exist
+    if not os.path.isfile(pdf_path):
+        with progress_lock:
+            progress_store[job_id]["split"] = {
+                "status": "error",
+                "progress": 0,
+                "total": 0,
+                "current": 0,
+                "error": f"Input PDF file not found: {pdf_path}",
+            }
+        return
+    if not os.path.isfile(page_text_path):
+        with progress_lock:
+            progress_store[job_id]["split"] = {
+                "status": "error",
+                "progress": 0,
+                "total": 0,
+                "current": 0,
+                "error": f"page_text.json not found: {page_text_path}",
+            }
+        return
+    # Read GUID from stored file
+    guid = ""
+    guid_path = os.path.join(out_dir, "guid.txt")
+    if os.path.isfile(guid_path):
+        try:
+            with open(guid_path, "r", encoding="utf-8") as f:
+                guid = f.read().strip()
+        except Exception:
+            pass
     with progress_lock:
         progress_store[job_id]["split"] = {"status": "running", "progress": 0, "total": 0, "current": 0}
     try:
@@ -89,6 +165,7 @@ def run_split_job(job_id: str):
             progress_callback=cb,
             conf=0.70,
             dpi=200,
+            guid=guid,
         )
         with progress_lock:
             progress_store[job_id]["split"] = {"status": "done", "progress": 100, "total": 0, "current": 0}
@@ -103,6 +180,20 @@ def run_split_job(job_id: str):
             }
 
 
+def extract_guid_from_filename(filename: str) -> str:
+    """Extract GUID/number from PDF filename. Returns first sequence of digits found, or first part before underscore."""
+    if not filename:
+        return ""
+    base = os.path.splitext(filename)[0]
+    # Try to find a sequence of digits (GUID/number)
+    match = re.search(r'\d+', base)
+    if match:
+        return match.group(0)
+    # If no digits, use first part before underscore
+    parts = base.split('_')
+    return parts[0] if parts else base[:8]
+
+
 @app.route("/api/upload-pdf", methods=["POST"])
 def upload_pdf():
     if "file" not in request.files:
@@ -115,6 +206,13 @@ def upload_pdf():
     os.makedirs(job_dir, exist_ok=True)
     pdf_path = os.path.join(job_dir, "input.pdf")
     f.save(pdf_path)
+    # Store original filename and extract GUID
+    original_filename = f.filename
+    guid = extract_guid_from_filename(original_filename)
+    with open(os.path.join(job_dir, "original_filename.txt"), "w", encoding="utf-8") as meta_file:
+        meta_file.write(original_filename)
+    with open(os.path.join(job_dir, "guid.txt"), "w", encoding="utf-8") as guid_file:
+        guid_file.write(guid)
     with progress_lock:
         progress_store[job_id] = {"ocr": {"status": "pending"}, "split": {"status": "pending"}}
     t = threading.Thread(target=run_ocr_job, args=(job_id, pdf_path))
@@ -127,6 +225,25 @@ def upload_pdf():
 def ocr_progress(job_id):
     with progress_lock:
         data = progress_store.get(job_id, {}).get("ocr", {"status": "unknown"})
+    # If job doesn't exist in store or status is unknown, check if files exist
+    if data.get("status") == "unknown" or not data:
+        job_dir = os.path.join(UPLOAD_DIR, job_id)
+        if not os.path.isdir(job_dir):
+            return jsonify({"status": "not_found", "error": "Job not found"})
+        page_text_path = os.path.join(job_dir, "page_text.json")
+        if os.path.isfile(page_text_path):
+            # Update progress_store with done status
+            with progress_lock:
+                if job_id not in progress_store:
+                    progress_store[job_id] = {"ocr": {}, "split": {}}
+                progress_store[job_id]["ocr"] = {"status": "done", "progress": 100, "total": 0, "current": 0}
+            return jsonify({"status": "done", "progress": 100, "total": 0, "current": 0})
+        # Check if OCR is still running (page_text.json doesn't exist yet but job dir exists)
+        pdf_path = os.path.join(job_dir, "input.pdf")
+        if os.path.isfile(pdf_path):
+            # OCR might still be running
+            return jsonify({"status": "running", "progress": 0, "total": 0, "current": 0})
+        return jsonify({"status": "not_found", "error": "Job not found"})
     return jsonify(data)
 
 
@@ -138,8 +255,11 @@ def split_with_ai():
         return jsonify({"error": "job_id required"}), 400
     job_dir = os.path.join(UPLOAD_DIR, job_id)
     page_text_path = os.path.join(job_dir, "page_text.json")
+    pdf_path = os.path.join(job_dir, "input.pdf")
     if not os.path.isfile(page_text_path):
         return jsonify({"error": "OCR not done or missing page_text.json"}), 400
+    if not os.path.isfile(pdf_path):
+        return jsonify({"error": "Input PDF file not found"}), 404
     with progress_lock:
         if progress_store.get(job_id, {}).get("split", {}).get("status") == "running":
             return jsonify({"error": "Split already in progress"}), 409
@@ -154,6 +274,16 @@ def split_with_ai():
 def split_progress(job_id):
     with progress_lock:
         data = progress_store.get(job_id, {}).get("split", {"status": "unknown"})
+    # If job doesn't exist in store, check if files exist
+    if data.get("status") == "unknown":
+        job_dir = os.path.join(UPLOAD_DIR, job_id)
+        if not os.path.isdir(job_dir):
+            return jsonify({"status": "not_found", "error": "Job not found"})
+        splits_dir = os.path.join(job_dir, "splits")
+        seg_path = os.path.join(splits_dir, "segments.json")
+        if os.path.isfile(seg_path):
+            return jsonify({"status": "done", "progress": 100})
+        return jsonify({"status": "not_found", "error": "Job not found"})
     return jsonify(data)
 
 
@@ -212,9 +342,26 @@ def create_manual_split(job_id):
         return jsonify({"error": f"Invalid page range (1–{page_count})"}), 400
     splits_dir = os.path.join(job_dir, "splits")
     os.makedirs(splits_dir, exist_ok=True)
-    safe_name = re.sub(r"[^\w\-]", "_", name)[:80]
-    fid = uuid.uuid4().hex[:8]
-    filename = f"manual_{fid}_{safe_name}.pdf"
+    # Read GUID from stored file
+    guid = ""
+    guid_path = os.path.join(job_dir, "guid.txt")
+    if os.path.isfile(guid_path):
+        try:
+            with open(guid_path, "r", encoding="utf-8") as f:
+                guid = f.read().strip()
+        except Exception:
+            pass
+    if not guid:
+        guid = uuid.uuid4().hex[:8]
+    # Convert name to camelCase (no spaces, no underscores)
+    pdf_name = re.sub(r"[^\w\s\-]", "", name).strip()
+    words = [w for w in re.split(r"[\s_]+", pdf_name) if w]
+    if words:
+        pdf_name = words[0].lower() + "".join(w.capitalize() for w in words[1:])
+    else:
+        pdf_name = "ManualSplit"
+    pdf_name = pdf_name[:80]
+    filename = f"{guid}_{pdf_name}.pdf"
     out_path = os.path.join(splits_dir, filename)
     import fitz
     with fitz.open(input_path) as src:
@@ -260,10 +407,14 @@ def list_splits(job_id):
 def get_segments(job_id):
     path = os.path.join(UPLOAD_DIR, job_id, "splits", "segments.json")
     if not os.path.isfile(path):
-        return jsonify({"segments": []})
+        return jsonify({"segments": [], "titles": [], "output_files": []})
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return jsonify({"segments": data.get("segments", [])})
+    return jsonify({
+        "segments": data.get("segments", []),
+        "titles": data.get("titles", []),
+        "output_files": data.get("output_files", [])
+    })
 
 
 @app.route("/api/page-text/<job_id>")
@@ -317,6 +468,80 @@ def delete_all_splits(job_id):
     if os.path.isfile(manual_path):
         os.remove(manual_path)
     return jsonify({"ok": True})
+
+
+RECENTS_DIR = os.path.join(ROOT, "recents")
+os.makedirs(RECENTS_DIR, exist_ok=True)
+
+
+@app.route("/api/recents")
+def list_recents():
+    """List all recent PDFs (page_text.json files in recents folder)."""
+    if not os.path.isdir(RECENTS_DIR):
+        return jsonify({"recents": []})
+    recents = []
+    for filename in os.listdir(RECENTS_DIR):
+        if filename.endswith("_page_text.json"):
+            # Extract original PDF name (remove _page_text.json suffix)
+            original_name = filename.replace("_page_text.json", "")
+            # Try to restore original filename - keep underscores that might be part of original name
+            # Only replace multiple consecutive underscores with space
+            original_name = re.sub(r"_+", " ", original_name).strip()
+            if not original_name.endswith(".pdf"):
+                original_name = original_name + ".pdf"
+            filepath = os.path.join(RECENTS_DIR, filename)
+            try:
+                mtime = os.path.getmtime(filepath)
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    page_count = data.get("page_count", 0)
+                recents.append({
+                    "filename": filename,
+                    "original_name": original_name,
+                    "page_count": page_count,
+                    "modified": mtime
+                })
+            except Exception:
+                pass
+    # Sort by modified time (newest first)
+    recents.sort(key=lambda x: x["modified"], reverse=True)
+    return jsonify({"recents": recents})
+
+
+@app.route("/api/recents/<filename>")
+def load_recent(filename):
+    """Load a recent PDF's page_text.json and input.pdf and create a new job for it."""
+    recent_path = os.path.join(RECENTS_DIR, filename)
+    if not os.path.isfile(recent_path) or not filename.endswith("_page_text.json"):
+        return jsonify({"error": "Recent file not found"}), 404
+    # Create new job
+    job_id = str(uuid.uuid4())
+    job_dir = os.path.join(UPLOAD_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    # Copy page_text.json to new job directory
+    page_text_path = os.path.join(job_dir, "page_text.json")
+    import shutil
+    shutil.copy2(recent_path, page_text_path)
+    # Also copy input.pdf if it exists in recents
+    base_name = filename.replace("_page_text.json", "")
+    recent_pdf_path = os.path.join(RECENTS_DIR, f"{base_name}_input.pdf")
+    pdf_path = os.path.join(job_dir, "input.pdf")
+    if os.path.isfile(recent_pdf_path):
+        shutil.copy2(recent_pdf_path, pdf_path)
+    # Extract original filename and GUID (same logic as list_recents)
+    original_name = base_name
+    original_name = re.sub(r"_+", " ", original_name).strip()
+    if not original_name.endswith(".pdf"):
+        original_name = original_name + ".pdf"
+    guid = extract_guid_from_filename(original_name)
+    with open(os.path.join(job_dir, "original_filename.txt"), "w", encoding="utf-8") as f:
+        f.write(original_name)
+    with open(os.path.join(job_dir, "guid.txt"), "w", encoding="utf-8") as f:
+        f.write(guid)
+    # Mark OCR as done
+    with progress_lock:
+        progress_store[job_id] = {"ocr": {"status": "done", "progress": 100}, "split": {"status": "pending"}}
+    return jsonify({"job_id": job_id, "original_name": original_name})
 
 
 if __name__ == "__main__":

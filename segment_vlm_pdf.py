@@ -186,12 +186,18 @@ def call_vlm_boundary(
     }
 
 
-def sanitize_title(s: str) -> str:
-    """1-3 words, underscore-separated, safe for filename."""
-    s = (s or "").strip()
+def title_to_camelcase(title: str) -> str:
+    """Convert title to camelCase for filename (no spaces, no underscores)."""
+    if not title:
+        return "document"
+    s = (title or "").strip()
     s = re.sub(r"[^\w\s-]", "", s)
     words = [w for w in re.split(r"[\s_]+", s) if w][:3]
-    return "_".join(words) if words else "document"
+    if not words:
+        return "document"
+    # Convert to camelCase: first word lowercase, rest capitalized
+    camel = words[0].lower() + "".join(w.capitalize() for w in words[1:])
+    return camel
 
 
 def call_vlm_title(
@@ -201,7 +207,7 @@ def call_vlm_title(
     first_page_img_url: Optional[str] = None,
     max_retries: int = 2,
 ) -> str:
-    """Get a 1-3 word title for a document from its first page."""
+    """Get a 1-3 word title for a document from its first page. Returns title as-is (no camelCase conversion)."""
     text = (first_page_text or "")[:4000]
     content: List[Dict[str, Any]] = [
         {"type": "text", "text": TITLE_USER_TEMPLATE.format(text=text)},
@@ -221,7 +227,8 @@ def call_vlm_title(
             )
             raw = (resp.choices[0].message.content or "").strip()
             raw = re.sub(r"^[\"']|[\"']$", "", raw)
-            return sanitize_title(raw)
+            # Return title as-is, no camelCase conversion
+            return raw if raw else "document"
         except Exception:
             time.sleep(0.5 * (attempt + 1))
     return "document"
@@ -241,10 +248,13 @@ def split_pdf_by_segments(
     segments: List[Dict[str, int]],
     output_dir: str,
     titles: Optional[List[str]] = None,
+    guid: Optional[str] = None,
 ) -> List[str]:
-    """Write one PDF per segment to output_dir. If titles provided, use {guid}_split_{title}.pdf."""
+    """Write one PDF per segment to output_dir. Format: {guid}_{pdfname}.pdf where pdfname has no underscores."""
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    if not guid:
+        guid = uuid.uuid4().hex[:8]
     out_paths = []
     src = fitz.open(pdf_path)
     try:
@@ -253,11 +263,12 @@ def split_pdf_by_segments(
             start = seg["start_page"]
             end = seg["end_page"]
             if titles and i < len(titles) and titles[i]:
-                guid = uuid.uuid4().hex[:8]
-                safe = re.sub(r"[^\w\-]", "_", (titles[i] or "document").strip())[:80]
-                out_name = f"{guid}_split_{safe}.pdf"
+                # Convert title to camelCase for filename only
+                pdf_name = title_to_camelcase(titles[i])
+                pdf_name = pdf_name[:80]
+                out_name = f"{guid}_{pdf_name}.pdf"
             else:
-                out_name = f"{base_name}_doc_{doc_index:03d}_p{start}-{end}.pdf"
+                out_name = f"{guid}_{base_name}_doc{doc_index:03d}_p{start}-{end}.pdf"
             out_path = os.path.join(output_dir, out_name)
             out_doc = fitz.open()
             for p in range(start - 1, end):
@@ -277,6 +288,7 @@ def run_segmentation(
     progress_callback: Optional[Callable[[int, int], None]] = None,
     conf: float = 0.70,
     dpi: int = 200,
+    guid: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run VLM boundary detection and split PDF. progress_callback(current_transition, total_transitions).
@@ -348,7 +360,7 @@ def run_segmentation(
             pass
         title = call_vlm_title(client, model, first_text, first_url)
         titles.append(title)
-    out_paths = split_pdf_by_segments(pdf_path, segments, output_dir, titles=titles)
+    out_paths = split_pdf_by_segments(pdf_path, segments, output_dir, titles=titles, guid=guid)
     output_files = [os.path.basename(p) for p in out_paths]
     segments_path = os.path.join(output_dir, "segments.json")
     with open(segments_path, "w", encoding="utf-8") as f:

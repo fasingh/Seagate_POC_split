@@ -1,2 +1,10 @@
 flask
 flask-cors
+PyMuPDF
+numpy
+Pillow
+easyocr
+python-dotenv
+openai
+torch
+torchvision
